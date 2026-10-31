@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>AirSpace OS</title>
+<style>
+html,body{touch-action:none;-webkit-user-select:none;user-select:none;margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,sans-serif;overflow:hidden}
+canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none}
+.eye{position:fixed;top:0;height:100%;width:50%;overflow:hidden;pointer-events:none}
+#eL{left:0}#eR{left:50%}
+/* the TV: a fixed-size page that is warped with matrix3d onto the wall every frame */
+.w{position:absolute;left:0;top:0;width:960px;height:540px;transform-origin:0 0;background:#000;display:none;overflow:hidden;will-change:transform;pointer-events:none}
+.w iframe{width:100%;height:100%;border:0;pointer-events:none}
+#ui{position:fixed;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:#000f;text-align:center;padding:12px;overflow:auto}
+button{background:#4f8cff;color:#fff;border:0;border-radius:10px;padding:12px 26px;font-size:17px}
+textarea{width:min(520px,90%);height:80px;font-size:13px}select{padding:6px;font-size:14px}
+small{opacity:.75;max-width:520px}
+</style></head><body>
+<canvas id="c"></canvas>
+<div class="eye" id="eL"><div class="w" id="wL"><div id="pL"></div></div></div>
+<div class="eye" id="eR"><div class="w" id="wR"><div id="pR"></div></div></div>
+<div id="ui">
+  <h2 style="margin:0">AirSpace OS</h2>
+  <small>YouTube links or video IDs, one per line:</small>
+  <textarea id="list"></textarea>
+  <label>Screen size: <select id="sz"><option value="55">55 inch</option><option value="75" selected>75 inch</option><option value="100">100 inch</option><option value="120">120 inch</option></select></label>
+  <small>Hold the phone in <b>landscape</b>, press Start and allow camera/motion.<br>
+  <b>Place:</b> look at the wall where you want the TV (a dashed outline shows where it will go), then tap <b>▶</b>. The TV is now mounted on that wall and does not move when you turn your head or walk.<br>
+  <b>Move:</b> drag one finger anywhere on the phone screen. <b>Resize:</b> pinch with two fingers (or ➖ ➕). <b>🔒</b> locks it so touches can't move it. <b>⌖</b> re-places it on the wall you are looking at now.<br>
+  <b>Dock:</b> ⏯ play/pause, ⏮ ⏭ video, ⏪ ⏩ ±10 s, 🔊 mute, 🌙 dim room, 📷 switch camera rendering (sharp / always-split), ⇅ flip camera image if upside down. Tap the phone once to bring the dock back; it fades when idle. Drag the thin bar above the dock to seek.</small>
+  <button id="xrb">Start</button>
+  <small id="xrs"></small>
+</div>
+<script>
+const $=id=>document.getElementById(id),c=$('c'),ctx=c.getContext('2d');
+const DEF=['dQw4w9WgXcQ','jNQXAC9IVRw','jfKfPfyJRdk'];
+try{$('list').value=(localStorage.ys?JSON.parse(localStorage.ys):DEF).join('\n')}catch(e){$('list').value=DEF.join('\n')}
+/* ---------- state ---------- */
+const S={mono:true,camOK:false,cam2D:true,flip:false,open:false,lock:false,dim:false,muted:false,playing:false,scr:75,prog:0,idx:0,list:[],
+ hit:null,cand:null,M:null,V:null,P:null,fe:800,EW:0,EH:0,camW:1920,camH:1080,t:0,ca:1,cool:0,toast:'',toastT:0,noCam:false,seekT:0};
+const TV={p:[0,0,-3],n:[0,0,1]};/* the TV in WORLD coordinates (metres): centre point + wall normal (always upright) */
+let PL,PR,st=null;
+const nrm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l]};
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const mv=(M,p)=>[M[0]*p[0]+M[4]*p[1]+M[8]*p[2]+M[12],M[1]*p[0]+M[5]*p[1]+M[9]*p[2]+M[13],M[2]*p[0]+M[6]*p[1]+M[10]*p[2]+M[14]];
+const clampS=x=>Math.max(30,Math.min(250,x));
+const tvW=()=>S.scr*.0254*.8716;/* width in metres of a 16:9 screen with this diagonal */
+const toast=t=>{S.toast=t;S.toastT=performance.now()+1800};
+/* ---------- YouTube (one copy per eye, kept in sync) ---------- */
+function mk(id,ev){return new YT.Player(id,{width:960,height:540,videoId:S.list[0],playerVars:{controls:0,playsinline:1,rel:0,modestbranding:1,disablekb:1,fs:0,iv_load_policy:3},events:ev})}
+window.onYouTubeIframeAPIReady=()=>{
+ PL=mk('pL',{onReady:e=>{if(S.open)e.target.playVideo()},onStateChange:e=>{const s=e.data;S.playing=s===1;if(!PR)return;if(s===1)PR.playVideo();else if(s===2)PR.pauseVideo();else if(s===0)play(S.idx+1)},onError:()=>play(S.idx+1)});
+ PR=mk('pR',{onReady:e=>e.target.mute()})};
+setInterval(()=>{try{if(PL&&PR&&PL.getPlayerState()===1){const a=PL.getCurrentTime();if(Math.abs(a-PR.getCurrentTime())>.3)PR.seekTo(a,true)}}catch(e){}},1500);
+setInterval(()=>{try{const t=PL.getDuration();S.prog=t?PL.getCurrentTime()/t:0}catch(e){}},300);
+function play(i){if(!S.list.length||!PL)return;S.idx=(i+S.list.length)%S.list.length;PL.loadVideoById(S.list[S.idx]);PR&&(PR.loadVideoById(S.list[S.idx]),PR.mute())}
+function pp(){try{PL.getPlayerState()===1?(PL.pauseVideo(),PR.pauseVideo()):(PL.playVideo(),PR.playVideo())}catch(e){}}
+function skip(s){try{const t=Math.max(0,PL.getCurrentTime()+s);PL.seekTo(t,true);PR.seekTo(t,true)}catch(e){}}
+function seekAt(p){try{const r=lay().bar,f=Math.max(0,Math.min(1,(p[0]-r.x)/r.w)),t=PL.getDuration()*f;PL.seekTo(t,true);PR.seekTo(t,true);S.prog=f}catch(e){}}
+function mute(){S.muted=!S.muted;try{S.muted?PL.mute():PL.unMute()}catch(e){}}
+/* ---------- placing the TV on a wall ---------- */
+/* where the TV would go right now: the real wall found at the centre of the view, else 3 m straight ahead */
+function candidate(){const m=S.M;if(!m)return null;const e=[m[12],m[13],m[14]],h=S.hit;
+ if(h){const d=Math.hypot(h.p[0]-e[0],h.p[1]-e[1],h.p[2]-e[2]);
+  if(d>.5&&d<9&&Math.abs(h.n[1])<.5){/* a vertical surface = a wall */
+   let n=nrm([h.n[0],0,h.n[2]]);if(dot(n,[e[0]-h.p[0],0,e[2]-h.p[2]])<0)n=[-n[0],0,-n[2]];
+   return{p:[h.p[0]+n[0]*.02,h.p[1],h.p[2]+n[2]*.02],n,wall:true}}}
+ const f=[-m[8],-m[9],-m[10]];let n=[-f[0],0,-f[2]];n=Math.hypot(n[0],n[2])<.2?[0,0,1]:nrm(n);
+ return{p:[e[0]+f[0]*3,e[1]+f[1]*3,e[2]+f[2]*3],n,wall:false}}
+function mount(){const k=S.cand;if(!k)return false;TV.p=k.p;TV.n=k.n;return true}
+function main(){if(!S.open){if(!mount())return;S.open=true;try{PL.playVideo();PR.playVideo()}catch(e){}}else pp()}
+function replace(){if(mount()){S.open=true;toast('Moved to the wall you are looking at')}}
+function size(f){if(S.lock)return;S.scr=clampS(S.scr*f);toast(Math.round(S.scr)+'"')}
+/* ---------- projection (world -> eye pixels) ---------- */
+const tvR=n=>[n[2],0,-n[0]];/* screen's right-hand direction as seen by someone facing it */
+function quad(T,s){const w=tvW()*s/2,h=tvW()*9/16*s/2,R=tvR(T.n),p=T.p;return[[-1,1],[1,1],[1,-1],[-1,-1]].map(([a,b])=>[p[0]+R[0]*w*a,p[1]+h*b,p[2]+R[2]*w*a])}
+function pr(X){const e=mv(S.V,X),d=-e[2];return{x:S.EW/2+S.fe*e[0]/d,y:S.EH/2-S.fe*e[1]/d,d}}
+function h3d(q,w,h){/* CSS matrix3d that maps a w x h rectangle onto the 4 projected corners (TL,TR,BR,BL) */
+ const[p0,p1,p2,p3]=q,dx1=p1.x-p2.x,dx2=p3.x-p2.x,dx3=p0.x-p1.x+p2.x-p3.x,dy1=p1.y-p2.y,dy2=p3.y-p2.y,dy3=p0.y-p1.y+p2.y-p3.y;
+ let g=0,hh=0;if(Math.abs(dx3)>1e-9||Math.abs(dy3)>1e-9){const den=dx1*dy2-dx2*dy1;g=(dx3*dy2-dx2*dy3)/den;hh=(dx1*dy3-dx3*dy1)/den}
+ const a=p1.x-p0.x+g*p1.x,b=p3.x-p0.x+hh*p3.x,d=p1.y-p0.y+g*p1.y,e=p3.y-p0.y+hh*p3.y;
+ return`matrix3d(${a/w},${d/w},0,${g/w},${b/h},${e/h},0,${hh/h},0,0,1,0,${p0.x},${p0.y},0,1)`}
+/* ---------- layout of the touch dock ---------- */
+const BT=[
+ {l:()=>!S.open||!S.playing?'▶':'⏸',f:main},
+ {l:()=>'⏮',f:()=>play(S.idx-1)},{l:()=>'⏭',f:()=>play(S.idx+1)},
+ {l:()=>'⏪',f:()=>skip(-10)},{l:()=>'⏩',f:()=>skip(10)},
+ {l:()=>S.muted?'🔇':'🔊',f:mute},
+ {l:()=>'➖',f:()=>size(1/1.1)},{l:()=>'➕',f:()=>size(1.1)},
+ {l:()=>'⌖',f:replace},
+ {l:()=>S.lock?'🔒':'🔓',f:()=>{S.lock=!S.lock;toast(S.lock?'TV locked':'TV unlocked')},on:()=>S.lock},
+ {l:()=>'🌙',f:()=>S.dim=!S.dim,on:()=>S.dim},
+ {l:()=>'📷',f:()=>{S.cam2D=!S.cam2D;toast(S.cam2D?'Camera: always split':'Camera: sharp mode')}},
+ {l:()=>'⇅',f:()=>S.flip=!S.flip,on:()=>S.flip}];
+function lay(){const N=BT.length,D=Math.min(52,(S.EW-14)/N),sz=D-6,x0=S.EW/2-N*D/2,y=S.EH-12-sz;
+ return{N,D,sz,x0,y,btn:BT.map((b,i)=>({x:x0+i*D+3,y,w:sz,h:sz})),bar:{x:S.EW*.12,y:y-22,w:S.EW*.76,h:10}}}
+function uiHit(p){if(S.open&&S.ca<.5)return null;const L=lay();
+ if(S.open){const r=L.bar;if(p[0]>r.x-10&&p[0]<r.x+r.w+10&&p[1]>r.y-16&&p[1]<r.y+r.h+16)return{type:'seek'}}
+ for(let i=0;i<BT.length;i++){const r=L.btn[i];if(p[0]>r.x-3&&p[0]<r.x+r.w+3&&p[1]>r.y-3&&p[1]<r.y+r.h+3)return{type:'btn',f:BT[i].f}}
+ return null}
+/* ---------- phone touch: tap buttons, 1 finger = move TV along the wall, 2 fingers = resize ---------- */
+const ptrs=new Map();let gest=null;
+const tpos=e=>[(!S.mono&&e.clientX>=innerWidth/2)?e.clientX-innerWidth/2:e.clientX,e.clientY];
+function wallPt(p){/* ray from the camera through the touch point, intersected with the TV's wall plane */
+ const M=S.M;if(!M||!S.fe)return null;const dv=[(p[0]-S.EW/2)/S.fe,-(p[1]-S.EH/2)/S.fe,-1],
+ dw=[M[0]*dv[0]+M[4]*dv[1]+M[8]*dv[2],M[1]*dv[0]+M[5]*dv[1]+M[9]*dv[2],M[2]*dv[0]+M[6]*dv[1]+M[10]*dv[2]],o=[M[12],M[13],M[14]],den=dot(dw,TV.n);
+ if(Math.abs(den)<1e-3)return null;const t=dot([TV.p[0]-o[0],TV.p[1]-o[1],TV.p[2]-o[2]],TV.n)/den;if(t<=0)return null;return[o[0]+dw[0]*t,o[1]+dw[1]*t,o[2]+dw[2]*t]}
+function grab(p){const h=wallPt(p);return h?[TV.p[0]-h[0],TV.p[1]-h[1],TV.p[2]-h[2]]:null}
+function dragTo(p,off){if(!off)return;const h=wallPt(p);if(h)TV.p=[h[0]+off[0],h[1]+off[1],h[2]+off[2]]}
+c.addEventListener('pointerdown',e=>{try{c.setPointerCapture(e.pointerId)}catch(_){}
+ ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY,sx:e.clientX,sy:e.clientY});S.t=performance.now();
+ if(ptrs.size>=2){const[a,b]=[...ptrs.values()];gest={type:'pinch',d0:Math.hypot(a.x-b.x,a.y-b.y)||1,s0:S.scr};return}
+ const p=tpos(e),h=uiHit(p);gest=h?{...h,id:e.pointerId}:{type:'drag',id:e.pointerId,started:false};
+ if(gest.type==='seek')seekAt(p)});
+c.addEventListener('pointermove',e=>{const q=ptrs.get(e.pointerId);if(!q)return;q.x=e.clientX;q.y=e.clientY;S.t=performance.now();if(!gest)return;
+ if(gest.type==='pinch'){if(ptrs.size>=2&&S.open&&!S.lock){const[a,b]=[...ptrs.values()];S.scr=clampS(gest.s0*Math.hypot(a.x-b.x,a.y-b.y)/gest.d0);toast(Math.round(S.scr)+'"')}return}
+ if(e.pointerId!==gest.id)return;const p=tpos(e),mvd=Math.hypot(e.clientX-q.sx,e.clientY-q.sy);
+ if(gest.type==='seek'){const n=performance.now();if(n>S.seekT){S.seekT=n+150;seekAt(p)}return}
+ if(gest.type==='btn'&&mvd>14)gest={type:'drag',id:gest.id,started:false};
+ if(gest.type==='drag'&&S.open&&!S.lock){if(!gest.started){if(mvd>6){gest.started=true;gest.off=grab(p)}}else dragTo(p,gest.off)}});
+const up=(e,ok)=>{if(!ptrs.has(e.pointerId))return;ptrs.delete(e.pointerId);
+ if(gest&&e.pointerId===gest.id){
+  if(ok&&gest.type==='btn'){const n=performance.now();if(n>S.cool){S.cool=n+250;gest.f()}}
+  if(ok&&gest.type==='seek')seekAt(tpos(e))}
+ if(!ptrs.size||(gest&&gest.type==='pinch'))gest=null};
+c.addEventListener('pointerup',e=>up(e,true));c.addEventListener('pointercancel',e=>up(e,false));
+c.addEventListener('beforexrselect',e=>e.preventDefault());
+/* ---------- drawing ---------- */
+function glass(r,rad,fill){ctx.fillStyle=fill||'rgba(255,255,255,.2)';ctx.strokeStyle='rgba(255,255,255,.4)';ctx.lineWidth=1.2;ctx.beginPath();ctx.roundRect(r.x,r.y,r.w,r.h,rad);ctx.fill();ctx.stroke()}
+function poly(q){ctx.beginPath();q.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));ctx.closePath()}
+function drawUI(dp){const L=lay(),a=S.open?S.ca:1;if(a<.02)return;
+ ctx.save();ctx.globalAlpha=a;ctx.translate(dp*6,0);
+ glass({x:L.x0-2,y:L.y-8,w:L.N*L.D+4,h:L.sz+16},(L.sz+16)/2,'rgba(20,20,30,.55)');
+ BT.forEach((b,i)=>{const r=L.btn[i],on=b.on&&b.on();glass(r,r.h/2,on?'rgba(79,140,255,.85)':null);ctx.fillStyle='#fff';ctx.font=r.h*.5+'px system-ui';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(b.l(),r.x+r.w/2,r.y+r.h/2+1)});
+ if(S.open){const r=L.bar,w=Math.max(6,r.w*S.prog);ctx.fillStyle='#fff5';ctx.beginPath();ctx.roundRect(r.x,r.y+2,r.w,6,3);ctx.fill();ctx.fillStyle='#fff';ctx.beginPath();ctx.roundRect(r.x,r.y+2,w,6,3);ctx.fill();ctx.beginPath();ctx.arc(r.x+w,r.y+5,7,0,7);ctx.fill()}
+ ctx.restore()}
+function drawText(t,y,sz,col){ctx.save();ctx.textAlign='center';ctx.textBaseline='middle';ctx.font='600 '+sz+'px system-ui';ctx.shadowColor='#000';ctx.shadowBlur=6;ctx.fillStyle=col||'#fff';ctx.fillText(t,S.EW/2,y);ctx.restore()}
+function render(){
+ if(!S.V||!S.P)return;
+ const iw=innerWidth,ih=innerHeight,dpr=Math.min(2,devicePixelRatio||1);
+ if(c.width!==Math.round(iw*dpr)||c.height!==Math.round(ih*dpr)){c.width=Math.round(iw*dpr);c.height=Math.round(ih*dpr)}
+ ctx.setTransform(dpr,0,0,dpr,0,0);
+ S.EW=S.mono?iw:iw/2;S.EH=ih;
+ /* focal length in eye pixels, matched to how the camera picture is cropped onto each eye */
+ const fs=S.P[0]*iw/2;
+ if(S.mono)S.fe=fs;else{const s0=Math.max(iw/S.camW,ih/S.camH),kk=Math.max(S.EW/S.camW,S.EH/S.camH);S.fe=fs/s0*kk}
+ const now=performance.now();S.ca+=((now-S.t<5000||!S.open?1:0)-S.ca)*.12;
+ if(!S.open)S.cand=candidate();
+ /* screen corners */
+ let q=null,qb=null,vis=false;
+ const T=S.open?TV:S.cand;
+ if(T){const a=quad(T,1).map(pr);if(a.every(p=>p.d>.15)){q=a;qb=quad(T,1.035).map(pr);
+   const xs=a.map(p=>p.x),ys=a.map(p=>p.y);vis=Math.min(...xs)<S.EW&&Math.max(...xs)>0&&Math.min(...ys)<S.EH&&Math.max(...ys)>0}}
+ ctx.clearRect(0,0,iw,ih);
+ const n=S.mono?1:2,hint=S.cand&&S.cand.wall;
+ for(let e=0;e<n;e++){const dp=S.mono?0:(e?1:-1);
+  ctx.save();ctx.beginPath();ctx.rect(e*S.EW,0,S.EW,S.EH);ctx.clip();ctx.translate(e*S.EW,0);
+  if(S.cam2D&&hc&&!S.mono){const k=Math.max(S.EW/hc.width,S.EH/hc.height),dw=hc.width*k,dh=hc.height*k;ctx.drawImage(hc,(S.EW-dw)/2,(S.EH-dh)/2,dw,dh)}
+  if(S.dim){ctx.fillStyle='rgba(0,0,0,.55)';ctx.fillRect(0,0,S.EW,S.EH)}
+  if(q&&S.open){/* black bezel round the screen; the video itself is the warped page on top */
+   ctx.save();ctx.shadowColor='#000b';ctx.shadowBlur=18;ctx.fillStyle='#070707';poly(qb);ctx.fill();ctx.restore();ctx.strokeStyle='#2a2a2a';ctx.lineWidth=1.5;poly(qb);ctx.stroke()}
+  if(q&&!S.open){/* preview outline before placing */
+   ctx.save();ctx.setLineDash([10,7]);ctx.lineWidth=3;ctx.strokeStyle=hint?'#76ff03':'#ffee58';ctx.fillStyle=hint?'rgba(118,255,3,.12)':'rgba(255,238,88,.1)';poly(q);ctx.fill();ctx.stroke();ctx.restore()}
+  if(!S.open){const x=S.EW/2,y=S.EH/2;ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x-10,y);ctx.lineTo(x+10,y);ctx.moveTo(x,y-10);ctx.lineTo(x,y+10);ctx.stroke();
+   drawText(hint?'Wall found - tap ▶ to mount the TV here':'No wall detected yet - tap ▶ to place it 3 m ahead',S.EH*.1,Math.max(13,S.EH*.04),hint?'#b6ff6a':'#ffee58')}
+  if(now<S.toastT)drawText(S.toast,S.EH*.1,Math.max(14,S.EH*.05));
+  drawUI(dp);
+  ctx.restore()}
+ /* the video windows */
+ for(let e=0;e<2;e++){const w=$(e?'wR':'wL');
+  if(!(S.open&&vis&&q)||(S.mono&&e)){w.style.display='none';continue}
+  w.style.display='block';w.style.transform=h3d(q,960,540)}}
+/* ---------- WebXR: 6DoF tracking + camera frames ---------- */
+let hc=null,hx=null,idat,pxb,FB,FH=0;const FW=960;
+let ses=null;$('xrb').onclick=async()=>{const note=$('xrs'),app=document.createElement('div');
+ try{
+  if(!navigator.xr||!(await navigator.xr.isSessionSupported('immersive-ar')))throw Error('WebXR AR is not supported here. Use Chrome on an ARCore Android phone.');
+  S.list=$('list').value.split('\n').map(s=>(s.match(/(?:v=|youtu\.be\/|embed\/|shorts\/|live\/)([\w-]{11})/)||s.trim().match(/^([\w-]{11})$/)||[])[1]).filter(Boolean);
+  if(!S.list.length)S.list=DEF;try{localStorage.ys=JSON.stringify(S.list)}catch(e){}
+  S.scr=+$('sz').value;note.textContent='Starting AR...';
+  app.style.cssText='position:fixed;inset:0;z-index:5;background:transparent';document.body.appendChild(app);app.addEventListener('beforexrselect',e=>e.preventDefault());
+  app.append(c,$('eL'),$('eR'));
+  st=document.createElement('div');st.style.cssText='position:absolute;top:10px;left:10px;z-index:9;font:14px system-ui;background:#0009;padding:6px 10px;border-radius:12px;pointer-events:none';st.textContent='Starting AR camera...';app.appendChild(st);
+  try{ses=await navigator.xr.requestSession('immersive-ar',{requiredFeatures:['dom-overlay'],optionalFeatures:['camera-access','hit-test'],domOverlay:{root:app}})}
+  catch(e){document.body.append(c,$('eL'),$('eR'));app.remove();throw Error('AR session refused ('+e.message+'). Allow camera + motion permission and try again.')}
+  $('ui').style.display='none';try{screen.orientation.lock('landscape')}catch(e){}
+  const gl=document.createElement('canvas').getContext('webgl',{xrCompatible:true});
+  await ses.updateRenderState({baseLayer:new XRWebGLLayer(ses,gl)});
+  const xb=new XRWebGLBinding(ses,gl),ref=await ses.requestReferenceSpace('local');let src=null;
+  try{src=await ses.requestHitTestSource({space:await ses.requestReferenceSpace('viewer')})}catch(e){}
+  const sc=document.createElement('script');sc.src='https://www.youtube.com/iframe_api';document.head.appendChild(sc);
+  const mkProg=(vs,fs)=>{const P=gl.createProgram();[[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]].forEach(([k,q])=>{const h=gl.createShader(k);gl.shaderSource(h,q);gl.compileShader(h);gl.attachShader(P,h)});gl.linkProgram(P);return P};
+  const FSH='precision mediump float;varying vec2 t;uniform sampler2D s;void main(){gl_FragColor=texture2D(s,t)}';
+  const GP=mkProg('attribute vec2 p;varying vec2 t;void main(){t=p*.5+.5;gl_Position=vec4(p,0,1)}',FSH);
+  const GD=mkProg('attribute vec2 p;uniform float f;varying vec2 t;void main(){t=vec2(p.x*.5+.5,f>0.?.5-p.y*.5:p.y*.5+.5);gl_Position=vec4(p,0,1)}',FSH);
+  const GB=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,GB);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  const bindQuad=P=>{const al=gl.getAttribLocation(P,'p');gl.bindBuffer(gl.ARRAY_BUFFER,GB);gl.enableVertexAttribArray(al);gl.vertexAttribPointer(al,2,gl.FLOAT,false,0,0)};
+  /* sharp mode: GPU draws the camera straight into both eyes */
+  const displayCam=(tex,cam)=>{const L=ses.renderState.baseLayer,W=L.framebufferWidth,H=L.framebufferHeight,hw=W/2,k=Math.max(hw/cam.width,H/cam.height),dw=cam.width*k,dh=cam.height*k;
+   gl.bindFramebuffer(gl.FRAMEBUFFER,L.framebuffer);gl.enable(gl.SCISSOR_TEST);gl.useProgram(GD);gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tex);
+   gl.uniform1i(gl.getUniformLocation(GD,'s'),0);gl.uniform1f(gl.getUniformLocation(GD,'f'),S.flip?-1:1);bindQuad(GD);
+   for(let e=0;e<2;e++){gl.scissor(e*hw,0,hw,H);gl.viewport(e*hw+(hw-dw)/2,(H-dh)/2,dw,dh);gl.drawArrays(gl.TRIANGLE_STRIP,0,4)}
+   gl.disable(gl.SCISSOR_TEST)};
+  /* always-split mode: copy the camera into a normal canvas and draw that in both eyes (guaranteed to be split) */
+  const readback=(tex,cam)=>{
+   if(!hc){FH=Math.round(FW*cam.height/cam.width);hc=document.createElement('canvas');hc.width=FW;hc.height=FH;hx=hc.getContext('2d');idat=hx.createImageData(FW,FH);pxb=new Uint8Array(FW*FH*4);
+    const ft=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,ft);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,FW,FH,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+    FB=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,FB);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,ft,0)}
+   gl.bindFramebuffer(gl.FRAMEBUFFER,FB);gl.disable(gl.SCISSOR_TEST);gl.viewport(0,0,FW,FH);gl.useProgram(GP);gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tex);
+   gl.uniform1i(gl.getUniformLocation(GP,'s'),0);bindQuad(GP);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);gl.readPixels(0,0,FW,FH,gl.RGBA,gl.UNSIGNED_BYTE,pxb);
+   if(S.flip){for(let y=0;y<FH;y++){const r=FH-1-y;idat.data.set(pxb.subarray(r*FW*4,(r+1)*FW*4),y*FW*4)}}else idat.data.set(pxb);
+   hx.putImageData(idat,0,0)};
+  const setLayout=()=>{$('eL').style.width=S.mono?'100%':'50%';$('eR').style.display=S.mono?'none':'block'};
+  setLayout();
+  let nf=0,miss=0;
+  ses.addEventListener('end',()=>location.reload());
+  ses.requestAnimationFrame(function xf(t,fr){ses.requestAnimationFrame(xf);
+   const L=ses.renderState.baseLayer;gl.bindFramebuffer(gl.FRAMEBUFFER,L.framebuffer);gl.disable(gl.SCISSOR_TEST);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);
+   const pose=fr.getViewerPose(ref);if(!pose)return;const vw=pose.views[0];
+   const V=vw.transform.inverse.matrix,M=vw.transform.matrix,P=vw.projectionMatrix;
+   if(src){const hr=fr.getHitTestResults(src);S.hit=null;if(hr.length){const hp=hr[0].getPose(ref);if(hp){const m=hp.transform.matrix;S.hit={p:[m[12],m[13],m[14]],n:[m[4],m[5],m[6]]}}}}
+   let fresh=true;const cam=vw.camera;
+   if(cam){const tex=xb.getCameraImage(cam);S.camW=cam.width;S.camH=cam.height;
+    if(!S.camOK){S.camOK=true;S.mono=false;S.noCam=false;setLayout();st&&(st.style.display='none')}
+    if(S.cam2D){if(nf++&1)fresh=false;else readback(tex,cam)}else displayCam(tex,cam);
+    gl.bindFramebuffer(gl.FRAMEBUFFER,L.framebuffer)}
+   else if(++miss>60&&!S.noCam&&!S.camOK){S.noCam=true;st.style.display='block';st.textContent='WebXR gave no camera frames, so the camera cannot be split on this phone/browser. The TV is still fixed on the wall (single view).'}
+   /* the TV is drawn with the SAME pose as the camera picture it is drawn on, so they never slip against each other */
+   if(fresh){S.V=V;S.M=M;S.P=P;render()}});
+ }catch(e){try{ses&&ses.end()}catch(x){}$('ui').style.display='flex';note.textContent='Error: '+e.message}};
+</script></body></html>
